@@ -185,6 +185,21 @@ h1 {
   background: #2f7d7e;
 }
 
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.pager span {
+  min-width: 74px;
+  color: #536471;
+  font-weight: 700;
+  text-align: center;
+}
+
 .empty-state {
   display: grid;
   place-items: center;

@@ -6,13 +6,22 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        OnceLock,
+    },
+    thread,
     time::UNIX_EPOCH,
 };
+use tauri::Emitter;
 use walkdir::WalkDir;
 
 const SUPPORTED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
 const SIMILAR_DISTANCE: u32 = 10;
 const BLUR_THRESHOLD: f64 = 80.0;
+const CACHE_FILE_NAME: &str = ".picture-cleaner-cache.tsv";
+
+static CANCEL_SCAN: OnceLock<AtomicBool> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,64 +59,225 @@ struct ImageGroup {
 struct ScanResult {
     scanned_count: usize,
     skipped_count: usize,
+    cache_hit_count: usize,
     exact_duplicate_groups: Vec<ImageGroup>,
     similar_image_groups: Vec<ImageGroup>,
     blurry_images: Vec<ImageItem>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    message: String,
+    current: usize,
+    total: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CacheRecord {
+    path: String,
+    size_bytes: u64,
+    modified_at: u64,
+    content_hash: String,
+    width: u32,
+    height: u32,
+    blur_score: Option<f64>,
+    perceptual_hash: Option<u64>,
+}
+
+impl CacheRecord {
+    fn has_details(&self) -> bool {
+        self.width > 0 && self.height > 0 && self.perceptual_hash.is_some()
+    }
+
+    fn item(&self) -> ImageItem {
+        ImageItem {
+            id: stable_id(Path::new(&self.path)),
+            path: self.path.clone(),
+            file_name: display_file_name(Path::new(&self.path)),
+            extension: Path::new(&self.path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("")
+                .to_lowercase(),
+            size_bytes: self.size_bytes,
+            width: self.width,
+            height: self.height,
+            modified_at: self.modified_at.to_string(),
+            blur_score: self.blur_score,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AnalyzedImage {
-    item: ImageItem,
-    content_hash: String,
-    perceptual_hash: u64,
+    record: CacheRecord,
+}
+
+impl AnalyzedImage {
+    fn item(&self) -> ImageItem {
+        self.record.item()
+    }
 }
 
 #[tauri::command]
-fn scan_images(root_path: String, options: ScanOptions) -> Result<ScanResult, String> {
+fn request_cancel_scan() {
+    cancel_flag().store(true, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn scan_images(
+    app: tauri::AppHandle,
+    root_path: String,
+    options: ScanOptions,
+) -> Result<ScanResult, String> {
+    cancel_flag().store(false, Ordering::Relaxed);
+
     let root = PathBuf::from(root_path);
     if !root.exists() || !root.is_dir() {
         return Err("選択したフォルダが見つかりません。".to_string());
     }
 
+    emit_progress(&app, "画像ファイルを探しています", 0, 0);
     let paths = collect_image_paths(&root, options.include_subfolders)?;
-    let mut analyzed = Vec::new();
-    let mut skipped_count = 0;
+    let total = paths.len();
+    let cache_path = root.join(CACHE_FILE_NAME);
+    let cache = load_cache(&cache_path);
+
+    emit_progress(&app, "変更されていない画像をキャッシュから確認しています", 0, total);
+    let mut cached_records = Vec::new();
+    let mut hash_targets = Vec::new();
+    let mut cache_hit_count = 0;
 
     for path in paths {
-        match analyze_image(&path, options.detect_blurry_images) {
-            Ok(image) => analyzed.push(image),
+        check_cancelled()?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let path_string = path_to_string(&path);
+        let modified_at = modified_secs(&metadata);
+        if let Some(record) = cache.get(&path_string) {
+            if record.size_bytes == metadata.len() && record.modified_at == modified_at {
+                cache_hit_count += 1;
+                cached_records.push(record.clone());
+                continue;
+            }
+        }
+        hash_targets.push(path);
+    }
+
+    emit_progress(&app, "新規・変更画像の内容を確認しています", 0, hash_targets.len());
+    let hash_counter = AtomicUsize::new(0);
+    let hashed_results = run_parallel(&hash_targets, |path| {
+        check_cancelled()?;
+        let current = hash_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        emit_progress(
+            &app,
+            &format!("「{}」の内容を確認中", display_file_name(path)),
+            current,
+            hash_targets.len(),
+        );
+        hash_image_file(path)
+    });
+
+    let mut all_records = cached_records;
+    let mut skipped_count = 0;
+    let mut cancelled = false;
+    for result in hashed_results {
+        match result {
+            Ok(record) => all_records.push(record),
+            Err(error) if error == "cancelled" => cancelled = true,
             Err(_) => skipped_count += 1,
         }
     }
+    if cancelled {
+        save_cache(&cache_path, &all_records);
+        return Err("スキャンをキャンセルしました。次回は保存済みの確認結果を使って再開します。".to_string());
+    }
 
     let exact_duplicate_groups = if options.detect_exact_duplicates {
-        build_exact_groups(&analyzed)
+        emit_progress(&app, "完全重複を確認しています", total, total);
+        build_exact_groups(&all_records)
     } else {
         Vec::new()
     };
+
+    let exact_duplicate_paths = collect_group_paths(&exact_duplicate_groups);
+    let mut cache_records = Vec::new();
+    let mut analyzed = Vec::new();
+    let mut detail_targets = Vec::new();
+    for record in all_records {
+        if exact_duplicate_paths.contains(&record.path) {
+            cache_records.push(record);
+            continue;
+        }
+        if record.has_details() {
+            cache_records.push(record.clone());
+            analyzed.push(AnalyzedImage { record });
+        } else {
+            detail_targets.push(PathBuf::from(record.path));
+        }
+    }
+
+    emit_progress(
+        &app,
+        "未解析画像のブレ値と類似判定データを作成しています",
+        0,
+        detail_targets.len(),
+    );
+    let analyze_counter = AtomicUsize::new(0);
+    let analyzed_results = run_parallel(&detail_targets, |path| {
+        check_cancelled()?;
+        let current = analyze_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        analyze_image(&app, path, options.detect_blurry_images, current, detail_targets.len())
+    });
+
+    for result in analyzed_results {
+        match result {
+            Ok(image) => {
+                cache_records.push(image.record.clone());
+                analyzed.push(image);
+            }
+            Err(error) if error == "cancelled" => cancelled = true,
+            Err(_) => skipped_count += 1,
+        }
+    }
+    if cancelled {
+        save_cache(&cache_path, &cache_records);
+        return Err("スキャンをキャンセルしました。次回は保存済みの確認結果を使って再開します。".to_string());
+    }
+
     let similar_image_groups = if options.detect_similar_images {
-        build_similar_groups(&analyzed)
+        emit_progress(&app, "類似画像をバケット方式で確認しています", analyzed.len(), analyzed.len());
+        build_similar_groups_bucketed(&analyzed)
     } else {
         Vec::new()
     };
+
     let blurry_images = if options.detect_blurry_images {
+        emit_progress(&app, "ブレの可能性がある画像をまとめています", analyzed.len(), analyzed.len());
         analyzed
             .iter()
             .filter_map(|image| {
                 image
-                    .item
+                    .record
                     .blur_score
                     .filter(|score| *score < BLUR_THRESHOLD)
-                    .map(|_| image.item.clone())
+                    .map(|_| image.item())
             })
             .collect()
     } else {
         Vec::new()
     };
 
+    save_cache(&cache_path, &cache_records);
+
+    emit_progress(&app, "スキャン結果を表示しています", total, total);
     Ok(ScanResult {
-        scanned_count: analyzed.len(),
+        scanned_count: cache_hit_count + hash_targets.len(),
         skipped_count,
+        cache_hit_count,
         exact_duplicate_groups,
         similar_image_groups,
         blurry_images,
@@ -118,9 +288,8 @@ fn scan_images(root_path: String, options: ScanOptions) -> Result<ScanResult, St
 fn move_to_trash(paths: Vec<String>) -> Result<Vec<String>, String> {
     let mut moved = Vec::new();
     for path in paths {
-        trash::delete(&path).map_err(|error| {
-            format!("ゴミ箱へ移動できませんでした: {} ({})", path, error)
-        })?;
+        trash::delete(&path)
+            .map_err(|error| format!("ゴミ箱へ移動できませんでした: {} ({})", path, error))?;
         moved.push(path);
     }
     Ok(moved)
@@ -154,74 +323,86 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn analyze_image(path: &Path, include_blur_score: bool) -> Result<AnalyzedImage, String> {
+fn hash_image_file(path: &Path) -> Result<CacheRecord, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let content = fs::read(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
     hasher.update(&content);
-    let content_hash = format!("{:x}", hasher.finalize());
 
+    Ok(CacheRecord {
+        path: path_to_string(path),
+        size_bytes: metadata.len(),
+        modified_at: modified_secs(&metadata),
+        content_hash: format!("{:x}", hasher.finalize()),
+        width: 0,
+        height: 0,
+        blur_score: None,
+        perceptual_hash: None,
+    })
+}
+
+fn analyze_image(
+    app: &tauri::AppHandle,
+    path: &Path,
+    include_blur_score: bool,
+    current: usize,
+    total: usize,
+) -> Result<AnalyzedImage, String> {
+    emit_progress(app, &format!("「{}」を読み込んでいます", display_file_name(path)), current, total);
+
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let image = ImageReader::open(path)
         .map_err(|error| error.to_string())?
         .with_guessed_format()
         .map_err(|error| error.to_string())?
         .decode()
         .map_err(|error| error.to_string())?;
-
     let (width, height) = image.dimensions();
+
     let blur_score = if include_blur_score {
+        emit_progress(app, &format!("「{}」のブレ値を計算中", display_file_name(path)), current, total);
         Some(calculate_blur_score(&image))
     } else {
         None
     };
 
-    let item = ImageItem {
-        id: stable_id(path),
-        path: path.to_string_lossy().to_string(),
-        file_name: path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("不明なファイル")
-            .to_string(),
-        extension: path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("")
-            .to_lowercase(),
-        size_bytes: metadata.len(),
-        width,
-        height,
-        modified_at: metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs().to_string())
-            .unwrap_or_default(),
-        blur_score,
-    };
+    emit_progress(
+        app,
+        &format!("「{}」の類似判定用データを作成中", display_file_name(path)),
+        current,
+        total,
+    );
+    let mut hash_record = hash_image_file(path)?;
+    hash_record.width = width;
+    hash_record.height = height;
+    hash_record.blur_score = blur_score;
+    hash_record.perceptual_hash = Some(calculate_perceptual_hash(&image));
+    hash_record.size_bytes = metadata.len();
+    hash_record.modified_at = modified_secs(&metadata);
 
-    Ok(AnalyzedImage {
-        item,
-        content_hash,
-        perceptual_hash: calculate_perceptual_hash(&image),
-    })
+    Ok(AnalyzedImage { record: hash_record })
 }
 
-fn build_exact_groups(images: &[AnalyzedImage]) -> Vec<ImageGroup> {
-    let mut by_hash: HashMap<&str, Vec<ImageItem>> = HashMap::new();
-    for image in images {
-        by_hash
-            .entry(&image.content_hash)
-            .or_default()
-            .push(image.item.clone());
+fn build_exact_groups(records: &[CacheRecord]) -> Vec<ImageGroup> {
+    let mut by_hash: HashMap<&str, Vec<&CacheRecord>> = HashMap::new();
+    for record in records {
+        if !record.content_hash.is_empty() {
+            by_hash.entry(&record.content_hash).or_default().push(record);
+        }
     }
 
     by_hash
         .into_iter()
-        .filter_map(|(hash, items)| {
-            if items.len() < 2 {
+        .filter_map(|(hash, records)| {
+            if records.len() < 2 {
                 return None;
             }
+
+            let items = records
+                .iter()
+                .map(|record| record.item())
+                .collect::<Vec<_>>();
+
             Some(ImageGroup {
                 id: format!("exact-{}", &hash[0..12]),
                 title: "同じ内容の画像".to_string(),
@@ -231,89 +412,104 @@ fn build_exact_groups(images: &[AnalyzedImage]) -> Vec<ImageGroup> {
         .collect()
 }
 
-fn build_similar_groups(images: &[AnalyzedImage]) -> Vec<ImageGroup> {
-    let mut used_indexes = HashSet::new();
-    let mut groups = Vec::new();
+fn collect_group_paths(groups: &[ImageGroup]) -> HashSet<String> {
+    groups
+        .iter()
+        .flat_map(|group| group.items.iter().map(|item| item.path.clone()))
+        .collect()
+}
 
+fn build_similar_groups_bucketed(images: &[AnalyzedImage]) -> Vec<ImageGroup> {
+    let mut buckets: HashMap<(usize, u16), Vec<usize>> = HashMap::new();
     for (index, image) in images.iter().enumerate() {
-        if used_indexes.contains(&index) {
-            continue;
-        }
-
-        let mut group = vec![image.item.clone()];
-        for (other_index, other) in images.iter().enumerate().skip(index + 1) {
-            if used_indexes.contains(&other_index) {
-                continue;
+        if let Some(hash) = image.record.perceptual_hash {
+            for band in 0..4 {
+                let key = ((hash >> (band * 16)) & 0xffff) as u16;
+                buckets.entry((band, key)).or_default().push(index);
             }
-
-            let distance = (image.perceptual_hash ^ other.perceptual_hash).count_ones();
-            if distance <= SIMILAR_DISTANCE {
-                used_indexes.insert(other_index);
-                group.push(other.item.clone());
-            }
-        }
-
-        if group.len() > 1 {
-            used_indexes.insert(index);
-            groups.push(ImageGroup {
-                id: format!("similar-{}", index),
-                title: "見た目が近い画像".to_string(),
-                items: group,
-            });
         }
     }
 
-    groups
+    let mut candidate_pairs = HashSet::new();
+    for indexes in buckets.values() {
+        if indexes.len() > 500 {
+            continue;
+        }
+        for (left_pos, left) in indexes.iter().enumerate() {
+            for right in indexes.iter().skip(left_pos + 1) {
+                candidate_pairs.insert((*left.min(right), *left.max(right)));
+            }
+        }
+    }
+
+    let mut parent = (0..images.len()).collect::<Vec<_>>();
+    for (left, right) in candidate_pairs {
+        let Some(left_hash) = images[left].record.perceptual_hash else { continue };
+        let Some(right_hash) = images[right].record.perceptual_hash else { continue };
+        if (left_hash ^ right_hash).count_ones() <= SIMILAR_DISTANCE {
+            union(&mut parent, left, right);
+        }
+    }
+
+    let mut grouped: HashMap<usize, Vec<ImageItem>> = HashMap::new();
+    for index in 0..images.len() {
+        let root = find(&mut parent, index);
+        grouped.entry(root).or_default().push(images[index].item());
+    }
+
+    grouped
+        .into_iter()
+        .filter_map(|(root, items)| {
+            if items.len() < 2 {
+                return None;
+            }
+            Some(ImageGroup {
+                id: format!("similar-{}", root),
+                title: "見た目が近い画像".to_string(),
+                items,
+            })
+        })
+        .collect()
+}
+
+fn find(parent: &mut [usize], index: usize) -> usize {
+    if parent[index] != index {
+        parent[index] = find(parent, parent[index]);
+    }
+    parent[index]
+}
+
+fn union(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find(parent, left);
+    let right_root = find(parent, right);
+    if left_root != right_root {
+        parent[right_root] = left_root;
+    }
 }
 
 fn calculate_perceptual_hash(image: &DynamicImage) -> u64 {
     let gray = image
-        .resize_exact(32, 32, image::imageops::FilterType::Triangle)
+        .resize_exact(9, 8, image::imageops::FilterType::Triangle)
         .to_luma8();
-    let mut dct = [[0.0; 32]; 32];
+    let mut hash = 0u64;
 
-    for u in 0..32 {
-        for v in 0..32 {
-            let mut sum = 0.0;
-            for x in 0..32 {
-                for y in 0..32 {
-                    let pixel = gray.get_pixel(x, y)[0] as f64;
-                    let cos_x = (((2 * x + 1) as f64 * u as f64 * std::f64::consts::PI) / 64.0).cos();
-                    let cos_y = (((2 * y + 1) as f64 * v as f64 * std::f64::consts::PI) / 64.0).cos();
-                    sum += pixel * cos_x * cos_y;
-                }
-            }
-            dct[u as usize][v as usize] = sum;
-        }
-    }
-
-    let mut values = Vec::with_capacity(64);
-    for u in 0..8 {
-        for v in 0..8 {
-            if u != 0 || v != 0 {
-                values.push(dct[u][v]);
+    for y in 0..8 {
+        for x in 0..8 {
+            let left = gray.get_pixel(x, y)[0];
+            let right = gray.get_pixel(x + 1, y)[0];
+            if left > right {
+                hash |= 1u64 << (y * 8 + x);
             }
         }
     }
 
-    let mut sorted = values.clone();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let median = sorted[sorted.len() / 2];
-
-    values
-        .iter()
-        .enumerate()
-        .fold(0u64, |hash, (index, value)| {
-            if *value > median {
-                hash | (1u64 << index)
-            } else {
-                hash
-            }
-        })
+    hash
 }
 
 fn calculate_blur_score(image: &DynamicImage) -> f64 {
-    let gray = image.to_luma8();
+    let gray = image
+        .resize(640, 640, image::imageops::FilterType::Triangle)
+        .to_luma8();
     let width = gray.width();
     let height = gray.height();
 
@@ -344,6 +540,159 @@ fn calculate_blur_score(image: &DynamicImage) -> f64 {
         / values.len() as f64
 }
 
+fn run_parallel<T, F>(paths: &[PathBuf], worker: F) -> Vec<Result<T, String>>
+where
+    T: Send,
+    F: Fn(&PathBuf) -> Result<T, String> + Sync,
+{
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in paths.chunks(chunk_size(paths.len())) {
+            let worker = &worker;
+            handles.push(scope.spawn(move || chunk.iter().map(worker).collect::<Vec<_>>()));
+        }
+
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+fn chunk_size(item_count: usize) -> usize {
+    let worker_count = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    item_count.div_ceil(worker_count).max(1)
+}
+
+fn load_cache(cache_path: &Path) -> HashMap<String, CacheRecord> {
+    let Ok(content) = fs::read_to_string(cache_path) else {
+        return HashMap::new();
+    };
+
+    content
+        .lines()
+        .filter_map(CacheRecord::from_cache_line)
+        .map(|record| (record.path.clone(), record))
+        .collect()
+}
+
+fn save_cache(cache_path: &Path, records: &[CacheRecord]) {
+    let mut lines = String::new();
+    for record in records {
+        lines.push_str(&record.to_cache_line());
+        lines.push('\n');
+    }
+    let _ = fs::write(cache_path, lines);
+}
+
+impl CacheRecord {
+    fn from_cache_line(line: &str) -> Option<CacheRecord> {
+        let parts = line.split('\t').collect::<Vec<_>>();
+        if parts.len() != 8 {
+            return None;
+        }
+        Some(CacheRecord {
+            path: unescape_field(parts[0]),
+            size_bytes: parts[1].parse().ok()?,
+            modified_at: parts[2].parse().ok()?,
+            content_hash: parts[3].to_string(),
+            width: parts[4].parse().ok()?,
+            height: parts[5].parse().ok()?,
+            blur_score: if parts[6].is_empty() { None } else { parts[6].parse().ok() },
+            perceptual_hash: if parts[7].is_empty() { None } else { parts[7].parse().ok() },
+        })
+    }
+
+    fn to_cache_line(&self) -> String {
+        [
+            escape_field(&self.path),
+            self.size_bytes.to_string(),
+            self.modified_at.to_string(),
+            self.content_hash.clone(),
+            self.width.to_string(),
+            self.height.to_string(),
+            self.blur_score.map(|score| score.to_string()).unwrap_or_default(),
+            self.perceptual_hash.map(|hash| hash.to_string()).unwrap_or_default(),
+        ]
+        .join("\t")
+    }
+}
+
+fn escape_field(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n")
+}
+
+fn unescape_field(value: &str) -> String {
+    let mut output = String::new();
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            output.push(match ch {
+                't' => '\t',
+                'n' => '\n',
+                '\\' => '\\',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn emit_progress(app: &tauri::AppHandle, message: &str, current: usize, total: usize) {
+    let _ = app.emit(
+        "scan-progress",
+        ScanProgress {
+            message: message.to_string(),
+            current,
+            total,
+        },
+    );
+}
+
+fn cancel_flag() -> &'static AtomicBool {
+    CANCEL_SCAN.get_or_init(|| AtomicBool::new(false))
+}
+
+fn check_cancelled() -> Result<(), String> {
+    if cancel_flag().load(Ordering::Relaxed) {
+        Err("cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn modified_secs(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("不明なファイル")
+        .to_string()
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
 fn stable_id(path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
@@ -353,7 +702,11 @@ fn stable_id(path: &Path) -> String {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![scan_images, move_to_trash])
+        .invoke_handler(tauri::generate_handler![
+            scan_images,
+            move_to_trash,
+            request_cancel_scan
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

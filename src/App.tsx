@@ -1,19 +1,31 @@
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   Check,
+  ChevronLeft,
+  ChevronRight,
   FolderOpen,
   ImageIcon,
   Loader2,
   RotateCcw,
   Search,
+  Square,
   Trash2,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ImageGroup, ImageItem, ScanOptions, ScanResult } from "./types";
 
 type ResultTab = "exact" | "similar" | "blurry";
+
+type ScanProgress = {
+  message: string;
+  current: number;
+  total: number;
+};
+
+const pageSize = 25;
 
 const defaultOptions: ScanOptions = {
   includeSubfolders: true,
@@ -37,6 +49,7 @@ function App() {
   const [isScanning, setIsScanning] = useState(false);
   const [isMoving, setIsMoving] = useState(false);
   const [message, setMessage] = useState("");
+  const [page, setPage] = useState(0);
 
   const currentGroups = useMemo(() => {
     if (!result) return [];
@@ -46,16 +59,41 @@ function App() {
       {
         id: "blurry",
         title: "ブレている可能性がある画像",
-        items: result.blurryImages,
+        items: result.blurryImages.filter((item) => item.blurScore !== null),
       },
     ].filter((group) => group.items.length > 0);
   }, [activeTab, result]);
+
+  const pagedGroups = useMemo(
+    () => currentGroups.slice(page * pageSize, page * pageSize + pageSize),
+    [currentGroups, page],
+  );
+  const pageCount = Math.max(1, Math.ceil(currentGroups.length / pageSize));
 
   const resultCounts = {
     exact: result?.exactDuplicateGroups.length ?? 0,
     similar: result?.similarImageGroups.length ?? 0,
     blurry: result?.blurryImages.length ?? 0,
   };
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    listen<ScanProgress>("scan-progress", (event) => {
+      const { message, current, total } = event.payload;
+      setMessage(total > 0 ? `${message} (${current}/${total})` : message);
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    setPage(0);
+  }, [activeTab, result]);
 
   async function selectFolder() {
     const selected = await open({
@@ -87,12 +125,19 @@ function App() {
         options,
       });
       setResult(scanResult);
-      setMessage(`${scanResult.scannedCount}件の画像を確認しました。`);
+      setMessage(
+        `${scanResult.scannedCount}件を確認しました。キャッシュ利用 ${scanResult.cacheHitCount}件、スキップ ${scanResult.skippedCount}件。`,
+      );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
       setIsScanning(false);
     }
+  }
+
+  async function cancelScan() {
+    await invoke("request_cancel_scan");
+    setMessage("キャンセルを要求しました。現在の処理が区切りまで進むと止まります。");
   }
 
   function toggleOption(key: keyof ScanOptions) {
@@ -197,6 +242,10 @@ function App() {
             {isScanning ? <Loader2 className="spin" size={18} /> : <Search size={18} />}
             スキャン開始
           </button>
+          <button className="ghost-button" onClick={cancelScan} disabled={!isScanning}>
+            <Square size={18} />
+            キャンセル
+          </button>
           <button className="danger-button" onClick={moveSelectedToTrash} disabled={isMoving || selectedPaths.size === 0}>
             {isMoving ? <Loader2 className="spin" size={18} /> : <Trash2 size={18} />}
             選択した画像をゴミ箱へ
@@ -224,6 +273,26 @@ function App() {
           ))}
         </div>
 
+        {result && currentGroups.length > pageSize && (
+          <div className="pager">
+            <button className="ghost-button" onClick={() => setPage((value) => Math.max(0, value - 1))} disabled={page === 0}>
+              <ChevronLeft size={18} />
+              前へ
+            </button>
+            <span>
+              {page + 1} / {pageCount}
+            </span>
+            <button
+              className="ghost-button"
+              onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))}
+              disabled={page >= pageCount - 1}
+            >
+              次へ
+              <ChevronRight size={18} />
+            </button>
+          </div>
+        )}
+
         {!result && <EmptyState isScanning={isScanning} />}
         {result && currentGroups.length === 0 && (
           <div className="empty-state">
@@ -233,7 +302,7 @@ function App() {
         )}
         {result && currentGroups.length > 0 && (
           <div className="group-list">
-            {currentGroups.map((group) => (
+            {pagedGroups.map((group) => (
               <ImageGroupView
                 key={group.id}
                 group={group}

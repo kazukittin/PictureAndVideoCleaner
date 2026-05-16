@@ -5,10 +5,6 @@ description = "Windows向け画像整理アプリ"
 authors = ["Picture Cleaner"]
 edition = "2021"
 
-[lib]
-name = "picture_and_video_cleaner_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

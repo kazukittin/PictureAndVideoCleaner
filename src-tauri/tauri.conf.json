@@ -33,6 +33,6 @@
   "bundle": {
     "active": true,
     "targets": "nsis",
-    "icon": []
+    "icon": ["icons/icon.ico"]
   }
 }

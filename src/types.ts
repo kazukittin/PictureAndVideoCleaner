@@ -26,6 +26,7 @@ export type ImageGroup = {
 export type ScanResult = {
   scannedCount: number;
   skippedCount: number;
+  cacheHitCount: number;
   exactDuplicateGroups: ImageGroup[];
   similarImageGroups: ImageGroup[];
   blurryImages: ImageItem[];
