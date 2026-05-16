@@ -11,8 +11,10 @@ import {
   Loader2,
   RotateCcw,
   Search,
+  Settings,
   Square,
   Trash2,
+  X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ImageGroup, ImageItem, ScanOptions, ScanResult } from "./types";
@@ -25,7 +27,8 @@ type ScanProgress = {
   total: number;
 };
 
-const pageSize = 25;
+const pageSize = 27;
+const minimumVisibleBlurScore = 1;
 
 const defaultOptions: ScanOptions = {
   includeSubfolders: true,
@@ -48,6 +51,7 @@ function App() {
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [isScanning, setIsScanning] = useState(false);
   const [isMoving, setIsMoving] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [message, setMessage] = useState("");
   const [page, setPage] = useState(0);
 
@@ -59,10 +63,17 @@ function App() {
       {
         id: "blurry",
         title: "ブレている可能性がある画像",
-        items: result.blurryImages.filter((item) => item.blurScore !== null),
+        items: result.blurryImages.filter(
+          (item) => item.blurScore !== null && item.blurScore > minimumVisibleBlurScore,
+        ),
       },
     ].filter((group) => group.items.length > 0);
   }, [activeTab, result]);
+
+  const visibleBlurryCount =
+    result?.blurryImages.filter(
+      (item) => item.blurScore !== null && item.blurScore > minimumVisibleBlurScore,
+    ).length ?? 0;
 
   const pagedGroups = useMemo(
     () => currentGroups.slice(page * pageSize, page * pageSize + pageSize),
@@ -73,7 +84,7 @@ function App() {
   const resultCounts = {
     exact: result?.exactDuplicateGroups.length ?? 0,
     similar: result?.similarImageGroups.length ?? 0,
-    blurry: result?.blurryImages.length ?? 0,
+    blurry: visibleBlurryCount,
   };
 
   useEffect(() => {
@@ -200,77 +211,36 @@ function App() {
 
   return (
     <main className="app-shell">
-      <section className="scan-panel">
-        <div>
-          <p className="eyebrow">Picture Cleaner</p>
-          <h1>似ている画像やブレ画像を見つけて、安全に整理</h1>
-        </div>
-
-        <div className="folder-row">
-          <button className="primary-button" onClick={selectFolder} disabled={isScanning}>
-            <FolderOpen size={18} />
-            フォルダを選択
-          </button>
-          <div className="folder-path">{folderPath || "スキャンするフォルダが未選択です"}</div>
-        </div>
-
-        <div className="option-grid">
-          <CheckOption
-            label="サブフォルダを含める"
-            checked={options.includeSubfolders}
-            onChange={() => toggleOption("includeSubfolders")}
-          />
-          <CheckOption
-            label="完全重複を検出"
-            checked={options.detectExactDuplicates}
-            onChange={() => toggleOption("detectExactDuplicates")}
-          />
-          <CheckOption
-            label="類似画像を検出"
-            checked={options.detectSimilarImages}
-            onChange={() => toggleOption("detectSimilarImages")}
-          />
-          <CheckOption
-            label="ブレ画像を検出"
-            checked={options.detectBlurryImages}
-            onChange={() => toggleOption("detectBlurryImages")}
-          />
-        </div>
-
-        <div className="action-row">
-          <button className="primary-button" onClick={startScan} disabled={isScanning || !folderPath}>
-            {isScanning ? <Loader2 className="spin" size={18} /> : <Search size={18} />}
-            スキャン開始
-          </button>
-          <button className="ghost-button" onClick={cancelScan} disabled={!isScanning}>
-            <Square size={18} />
-            キャンセル
-          </button>
-          <button className="danger-button" onClick={moveSelectedToTrash} disabled={isMoving || selectedPaths.size === 0}>
-            {isMoving ? <Loader2 className="spin" size={18} /> : <Trash2 size={18} />}
-            選択した画像をゴミ箱へ
-          </button>
-          <button className="ghost-button" onClick={() => setSelectedPaths(new Set())} disabled={selectedPaths.size === 0}>
-            <RotateCcw size={18} />
-            選択を解除
-          </button>
-        </div>
-
-        {message && <p className="status-message">{message}</p>}
-      </section>
-
       <section className="result-panel">
-        <div className="tabs" role="tablist" aria-label="検出結果">
-          {tabs.map((tab) => (
-            <button
-              key={tab.id}
-              className={activeTab === tab.id ? "tab active" : "tab"}
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.label}
-              <span>{resultCounts[tab.id]}</span>
+        <div className="result-toolbar">
+          <div className="tabs" role="tablist" aria-label="検出結果">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                className={activeTab === tab.id ? "tab active" : "tab"}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                {tab.label}
+                <span>{resultCounts[tab.id]}</span>
+              </button>
+            ))}
+          </div>
+          <div className="toolbar-actions">
+            <button className="primary-button" onClick={selectFolder} disabled={isScanning}>
+              <FolderOpen size={18} />
+              フォルダを選択
             </button>
-          ))}
+            <div className="folder-path">{folderPath || "スキャンするフォルダが未選択です"}</div>
+            <button
+              className="icon-button"
+              onClick={() => setIsSettingsOpen(true)}
+              disabled={isScanning}
+              aria-label="設定"
+              title="設定"
+            >
+              <Settings size={20} />
+            </button>
+          </div>
         </div>
 
         {result && currentGroups.length > pageSize && (
@@ -313,6 +283,79 @@ function App() {
           </div>
         )}
       </section>
+
+      <footer className="scan-footer">
+        <div className="action-row">
+          <button
+            className={isScanning ? "ghost-button" : "primary-button"}
+            onClick={isScanning ? cancelScan : startScan}
+            disabled={!isScanning && !folderPath}
+          >
+            {isScanning ? <Square size={18} /> : <Search size={18} />}
+            {isScanning ? "キャンセル" : "スキャン開始"}
+          </button>
+          <button className="danger-button" onClick={moveSelectedToTrash} disabled={isMoving || selectedPaths.size === 0}>
+            {isMoving ? <Loader2 className="spin" size={18} /> : <Trash2 size={18} />}
+            選択した画像をゴミ箱へ
+          </button>
+          <button className="ghost-button" onClick={() => setSelectedPaths(new Set())} disabled={selectedPaths.size === 0}>
+            <RotateCcw size={18} />
+            選択を解除
+          </button>
+        </div>
+
+        {message && <p className="status-message">{message}</p>}
+      </footer>
+
+      {isSettingsOpen && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setIsSettingsOpen(false)}>
+          <section
+            className="settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <h2 id="settings-title">スキャン設定</h2>
+              <button className="icon-button" onClick={() => setIsSettingsOpen(false)} aria-label="設定を閉じる">
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="option-grid">
+              <CheckOption
+                label="サブフォルダを含める"
+                checked={options.includeSubfolders}
+                onChange={() => toggleOption("includeSubfolders")}
+              />
+              <CheckOption
+                label="完全重複を検出"
+                checked={options.detectExactDuplicates}
+                onChange={() => toggleOption("detectExactDuplicates")}
+              />
+              <CheckOption
+                label="類似画像を検出"
+                checked={options.detectSimilarImages}
+                onChange={() => toggleOption("detectSimilarImages")}
+              />
+              <CheckOption
+                label="ブレ画像を検出"
+                checked={options.detectBlurryImages}
+                onChange={() => toggleOption("detectBlurryImages")}
+              />
+            </div>
+
+            <div className="modal-footer">
+              <button className="primary-button" onClick={() => setIsSettingsOpen(false)}>
+                <Check size={18} />
+                完了
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
     </main>
   );
 }

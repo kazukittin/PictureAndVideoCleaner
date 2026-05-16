@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
-    fs,
+    env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
@@ -19,7 +19,6 @@ use walkdir::WalkDir;
 const SUPPORTED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
 const SIMILAR_DISTANCE: u32 = 10;
 const BLUR_THRESHOLD: f64 = 80.0;
-const CACHE_FILE_NAME: &str = ".picture-cleaner-cache.tsv";
 
 static CANCEL_SCAN: OnceLock<AtomicBool> = OnceLock::new();
 
@@ -86,16 +85,30 @@ struct CacheRecord {
 }
 
 impl CacheRecord {
+    fn basic(path: &Path, metadata: &fs::Metadata) -> CacheRecord {
+        CacheRecord {
+            path: path_to_string(path),
+            size_bytes: metadata.len(),
+            modified_at: modified_secs(metadata),
+            content_hash: String::new(),
+            width: 0,
+            height: 0,
+            blur_score: None,
+            perceptual_hash: None,
+        }
+    }
+
     fn has_details(&self) -> bool {
         self.width > 0 && self.height > 0 && self.perceptual_hash.is_some()
     }
 
     fn item(&self) -> ImageItem {
+        let path = Path::new(&self.path);
         ImageItem {
-            id: stable_id(Path::new(&self.path)),
+            id: stable_id(path),
             path: self.path.clone(),
-            file_name: display_file_name(Path::new(&self.path)),
-            extension: Path::new(&self.path)
+            file_name: display_file_name(path),
+            extension: path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .unwrap_or("")
@@ -106,6 +119,37 @@ impl CacheRecord {
             modified_at: self.modified_at.to_string(),
             blur_score: self.blur_score,
         }
+    }
+
+    fn from_cache_line(line: &str) -> Option<CacheRecord> {
+        let parts = line.split('\t').collect::<Vec<_>>();
+        if parts.len() != 8 {
+            return None;
+        }
+        Some(CacheRecord {
+            path: unescape_field(parts[0]),
+            size_bytes: parts[1].parse().ok()?,
+            modified_at: parts[2].parse().ok()?,
+            content_hash: parts[3].to_string(),
+            width: parts[4].parse().ok()?,
+            height: parts[5].parse().ok()?,
+            blur_score: if parts[6].is_empty() { None } else { parts[6].parse().ok() },
+            perceptual_hash: if parts[7].is_empty() { None } else { parts[7].parse().ok() },
+        })
+    }
+
+    fn to_cache_line(&self) -> String {
+        [
+            escape_field(&self.path),
+            self.size_bytes.to_string(),
+            self.modified_at.to_string(),
+            self.content_hash.clone(),
+            self.width.to_string(),
+            self.height.to_string(),
+            self.blur_score.map(|score| score.to_string()).unwrap_or_default(),
+            self.perceptual_hash.map(|hash| hash.to_string()).unwrap_or_default(),
+        ]
+        .join("\t")
     }
 }
 
@@ -126,7 +170,17 @@ fn request_cancel_scan() {
 }
 
 #[tauri::command]
-fn scan_images(
+async fn scan_images(
+    app: tauri::AppHandle,
+    root_path: String,
+    options: ScanOptions,
+) -> Result<ScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_images_inner(app, root_path, options))
+        .await
+        .map_err(|error| format!("スキャン処理を開始できませんでした: {}", error))?
+}
+
+fn scan_images_inner(
     app: tauri::AppHandle,
     root_path: String,
     options: ScanOptions,
@@ -141,64 +195,44 @@ fn scan_images(
     emit_progress(&app, "画像ファイルを探しています", 0, 0);
     let paths = collect_image_paths(&root, options.include_subfolders)?;
     let total = paths.len();
-    let cache_path = root.join(CACHE_FILE_NAME);
+    let cache_path = local_cache_path(&root)?;
     let cache = load_cache(&cache_path);
 
-    emit_progress(&app, "変更されていない画像をキャッシュから確認しています", 0, total);
-    let mut cached_records = Vec::new();
-    let mut hash_targets = Vec::new();
+    emit_progress(&app, "ローカルキャッシュを確認しています", 0, total);
+    let mut records = Vec::with_capacity(total);
     let mut cache_hit_count = 0;
+    let mut skipped_count = 0;
 
     for path in paths {
         check_cancelled()?;
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(_) => {
+                skipped_count += 1;
+                continue;
+            }
         };
+
         let path_string = path_to_string(&path);
         let modified_at = modified_secs(&metadata);
         if let Some(record) = cache.get(&path_string) {
             if record.size_bytes == metadata.len() && record.modified_at == modified_at {
                 cache_hit_count += 1;
-                cached_records.push(record.clone());
+                records.push(record.clone());
                 continue;
             }
         }
-        hash_targets.push(path);
+
+        records.push(CacheRecord::basic(&path, &metadata));
     }
 
-    emit_progress(&app, "新規・変更画像の内容を確認しています", 0, hash_targets.len());
-    let hash_counter = AtomicUsize::new(0);
-    let hashed_results = run_parallel(&hash_targets, |path| {
-        check_cancelled()?;
-        let current = hash_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        emit_progress(
-            &app,
-            &format!("「{}」の内容を確認中", display_file_name(path)),
-            current,
-            hash_targets.len(),
-        );
-        hash_image_file(path)
-    });
-
-    let mut all_records = cached_records;
-    let mut skipped_count = 0;
-    let mut cancelled = false;
-    for result in hashed_results {
-        match result {
-            Ok(record) => all_records.push(record),
-            Err(error) if error == "cancelled" => cancelled = true,
-            Err(_) => skipped_count += 1,
-        }
-    }
-    if cancelled {
-        save_cache(&cache_path, &all_records);
-        return Err("スキャンをキャンセルしました。次回は保存済みの確認結果を使って再開します。".to_string());
+    if options.detect_exact_duplicates {
+        hash_duplicate_candidates(&app, &mut records, &cache_path)?;
     }
 
     let exact_duplicate_groups = if options.detect_exact_duplicates {
-        emit_progress(&app, "完全重複を確認しています", total, total);
-        build_exact_groups(&all_records)
+        emit_progress(&app, "完全重複を確認しています", records.len(), records.len());
+        build_exact_groups(&records)
     } else {
         Vec::new()
     };
@@ -207,7 +241,8 @@ fn scan_images(
     let mut cache_records = Vec::new();
     let mut analyzed = Vec::new();
     let mut detail_targets = Vec::new();
-    for record in all_records {
+
+    for record in records {
         if exact_duplicate_paths.contains(&record.path) {
             cache_records.push(record);
             continue;
@@ -216,7 +251,8 @@ fn scan_images(
             cache_records.push(record.clone());
             analyzed.push(AnalyzedImage { record });
         } else {
-            detail_targets.push(PathBuf::from(record.path));
+            detail_targets.push(record.clone());
+            cache_records.push(record);
         }
     }
 
@@ -227,22 +263,41 @@ fn scan_images(
         detail_targets.len(),
     );
     let analyze_counter = AtomicUsize::new(0);
-    let analyzed_results = run_parallel(&detail_targets, |path| {
+    let analyzed_results = run_parallel_records(&detail_targets, |record| {
         check_cancelled()?;
         let current = analyze_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        analyze_image(&app, path, options.detect_blurry_images, current, detail_targets.len())
+        analyze_image(
+            &app,
+            Path::new(&record.path),
+            &record.content_hash,
+            options.detect_blurry_images,
+            current,
+            detail_targets.len(),
+        )
     });
 
-    for result in analyzed_results {
-        match result {
-            Ok(image) => {
-                cache_records.push(image.record.clone());
-                analyzed.push(image);
+    let mut cancelled = false;
+    let analyzed_by_path = analyzed_results
+        .into_iter()
+        .filter_map(|result| match result {
+            Ok(image) => Some((image.record.path.clone(), image)),
+            Err(error) if error == "cancelled" => {
+                cancelled = true;
+                None
             }
-            Err(error) if error == "cancelled" => cancelled = true,
-            Err(_) => skipped_count += 1,
-        }
-    }
+            Err(_) => {
+                skipped_count += 1;
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+
+    cache_records = cache_records
+        .into_iter()
+        .map(|record| analyzed_by_path.get(&record.path).map(|image| image.record.clone()).unwrap_or(record))
+        .collect();
+    analyzed.extend(analyzed_by_path.into_values());
+
     if cancelled {
         save_cache(&cache_path, &cache_records);
         return Err("スキャンをキャンセルしました。次回は保存済みの確認結果を使って再開します。".to_string());
@@ -275,7 +330,7 @@ fn scan_images(
 
     emit_progress(&app, "スキャン結果を表示しています", total, total);
     Ok(ScanResult {
-        scanned_count: cache_hit_count + hash_targets.len(),
+        scanned_count: total,
         skipped_count,
         cache_hit_count,
         exact_duplicate_groups,
@@ -293,6 +348,75 @@ fn move_to_trash(paths: Vec<String>) -> Result<Vec<String>, String> {
         moved.push(path);
     }
     Ok(moved)
+}
+
+fn hash_duplicate_candidates(
+    app: &tauri::AppHandle,
+    records: &mut [CacheRecord],
+    cache_path: &Path,
+) -> Result<(), String> {
+    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        by_size.entry(record.size_bytes).or_default().push(index);
+    }
+
+    let hash_targets = by_size
+        .values()
+        .filter(|indexes| indexes.len() > 1)
+        .flat_map(|indexes| {
+            indexes.iter().filter_map(|index| {
+                if records[*index].content_hash.is_empty() {
+                    Some(PathBuf::from(&records[*index].path))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    emit_progress(
+        app,
+        "同じサイズの画像だけ内容を確認しています",
+        0,
+        hash_targets.len(),
+    );
+    let hash_counter = AtomicUsize::new(0);
+    let hashed_results = run_parallel(&hash_targets, |path| {
+        check_cancelled()?;
+        let current = hash_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        emit_progress(
+            app,
+            &format!("「{}」の内容を確認中", display_file_name(path)),
+            current,
+            hash_targets.len(),
+        );
+        hash_file(path).map(|hash| (path_to_string(path), hash))
+    });
+
+    let mut hash_by_path = HashMap::new();
+    let mut cancelled = false;
+    for result in hashed_results {
+        match result {
+            Ok((path, hash)) => {
+                hash_by_path.insert(path, hash);
+            }
+            Err(error) if error == "cancelled" => cancelled = true,
+            Err(_) => {}
+        }
+    }
+
+    for record in records.iter_mut() {
+        if let Some(hash) = hash_by_path.get(&record.path) {
+            record.content_hash = hash.clone();
+        }
+    }
+
+    save_cache(cache_path, records);
+    if cancelled {
+        return Err("スキャンをキャンセルしました。次回は保存済みの確認結果を使って再開します。".to_string());
+    }
+
+    Ok(())
 }
 
 fn collect_image_paths(root: &Path, include_subfolders: bool) -> Result<Vec<PathBuf>, String> {
@@ -323,27 +447,17 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn hash_image_file(path: &Path) -> Result<CacheRecord, String> {
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+fn hash_file(path: &Path) -> Result<String, String> {
     let content = fs::read(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
     hasher.update(&content);
-
-    Ok(CacheRecord {
-        path: path_to_string(path),
-        size_bytes: metadata.len(),
-        modified_at: modified_secs(&metadata),
-        content_hash: format!("{:x}", hasher.finalize()),
-        width: 0,
-        height: 0,
-        blur_score: None,
-        perceptual_hash: None,
-    })
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn analyze_image(
     app: &tauri::AppHandle,
     path: &Path,
+    content_hash: &str,
     include_blur_score: bool,
     current: usize,
     total: usize,
@@ -372,15 +486,15 @@ fn analyze_image(
         current,
         total,
     );
-    let mut hash_record = hash_image_file(path)?;
-    hash_record.width = width;
-    hash_record.height = height;
-    hash_record.blur_score = blur_score;
-    hash_record.perceptual_hash = Some(calculate_perceptual_hash(&image));
-    hash_record.size_bytes = metadata.len();
-    hash_record.modified_at = modified_secs(&metadata);
 
-    Ok(AnalyzedImage { record: hash_record })
+    let mut record = CacheRecord::basic(path, &metadata);
+    record.content_hash = content_hash.to_string();
+    record.width = width;
+    record.height = height;
+    record.blur_score = blur_score;
+    record.perceptual_hash = Some(calculate_perceptual_hash(&image));
+
+    Ok(AnalyzedImage { record })
 }
 
 fn build_exact_groups(records: &[CacheRecord]) -> Vec<ImageGroup> {
@@ -398,15 +512,10 @@ fn build_exact_groups(records: &[CacheRecord]) -> Vec<ImageGroup> {
                 return None;
             }
 
-            let items = records
-                .iter()
-                .map(|record| record.item())
-                .collect::<Vec<_>>();
-
             Some(ImageGroup {
                 id: format!("exact-{}", &hash[0..12]),
                 title: "同じ内容の画像".to_string(),
-                items,
+                items: records.iter().map(|record| record.item()).collect(),
             })
         })
         .collect()
@@ -563,12 +672,44 @@ where
     })
 }
 
+fn run_parallel_records<T, F>(records: &[CacheRecord], worker: F) -> Vec<Result<T, String>>
+where
+    T: Send,
+    F: Fn(&CacheRecord) -> Result<T, String> + Sync,
+{
+    if records.is_empty() {
+        return Vec::new();
+    }
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in records.chunks(chunk_size(records.len())) {
+            let worker = &worker;
+            handles.push(scope.spawn(move || chunk.iter().map(worker).collect::<Vec<_>>()));
+        }
+
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
 fn chunk_size(item_count: usize) -> usize {
-    let worker_count = thread::available_parallelism()
+    let available = thread::available_parallelism()
         .map(|count| count.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
+        .unwrap_or(4);
+    let worker_count = available.saturating_sub(1).clamp(1, 4);
     item_count.div_ceil(worker_count).max(1)
+}
+
+fn local_cache_path(root: &Path) -> Result<PathBuf, String> {
+    let base = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cache_dir = base.join("PictureCleaner").join("scan-cache");
+    fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
+    Ok(cache_dir.join(format!("{}.tsv", stable_id(root))))
 }
 
 fn load_cache(cache_path: &Path) -> HashMap<String, CacheRecord> {
@@ -590,39 +731,6 @@ fn save_cache(cache_path: &Path, records: &[CacheRecord]) {
         lines.push('\n');
     }
     let _ = fs::write(cache_path, lines);
-}
-
-impl CacheRecord {
-    fn from_cache_line(line: &str) -> Option<CacheRecord> {
-        let parts = line.split('\t').collect::<Vec<_>>();
-        if parts.len() != 8 {
-            return None;
-        }
-        Some(CacheRecord {
-            path: unescape_field(parts[0]),
-            size_bytes: parts[1].parse().ok()?,
-            modified_at: parts[2].parse().ok()?,
-            content_hash: parts[3].to_string(),
-            width: parts[4].parse().ok()?,
-            height: parts[5].parse().ok()?,
-            blur_score: if parts[6].is_empty() { None } else { parts[6].parse().ok() },
-            perceptual_hash: if parts[7].is_empty() { None } else { parts[7].parse().ok() },
-        })
-    }
-
-    fn to_cache_line(&self) -> String {
-        [
-            escape_field(&self.path),
-            self.size_bytes.to_string(),
-            self.modified_at.to_string(),
-            self.content_hash.clone(),
-            self.width.to_string(),
-            self.height.to_string(),
-            self.blur_score.map(|score| score.to_string()).unwrap_or_default(),
-            self.perceptual_hash.map(|hash| hash.to_string()).unwrap_or_default(),
-        ]
-        .join("\t")
-    }
 }
 
 fn escape_field(value: &str) -> String {
